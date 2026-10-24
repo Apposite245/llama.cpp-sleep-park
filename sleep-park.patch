@@ -1,0 +1,648 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 8b302d5..d543edc 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3837,6 +3837,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.sleep_idle_seconds = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--sleep-park"},
++        "when sleeping, keep the model weights in pinned host memory instead of freeing them, so waking copies them back instead of loading the file (needs --sleep-idle-seconds)",
++        [](common_params & params) {
++            params.sleep_park = true;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--sleep-park-keep-ram"},
++        "with --sleep-park, keep the pinned host memory while awake too: parking is faster, but that RAM stays locked as long as the model is loaded",
++        [](common_params & params) {
++            params.sleep_park = true;
++            params.sleep_park_keep_ram = true;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"--simple-io"},
+         "use basic IO for better compatibility in subprocesses and limited consoles",
+diff --git a/common/common.cpp b/common/common.cpp
+index b59e66e..9415361 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -26,6 +26,8 @@
+ #include <fstream>
+ #include <iostream>
+ #include <iterator>
++#include <map>
++#include <mutex>
+ #include <regex>
+ #include <sstream>
+ #include <string>
+@@ -1242,7 +1244,21 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+ 
+-    if (params.fit_params) {
++    // a parked model wakes with the layout it was fitted to, so reuse that fit instead of probing again
++    static std::mutex fitted_mutex;
++    static std::map<std::string, std::pair<llama_model_params, llama_context_params>> fitted;
++    bool refit = params.fit_params;
++    if (refit && llama_model_park_cache_has(params.model.path.c_str())) {
++        std::lock_guard<std::mutex> lock(fitted_mutex);
++        auto it = fitted.find(params.model.path);
++        if (it != fitted.end()) {
++            mparams = it->second.first;
++            cparams = it->second.second;
++            refit   = false;
++        }
++    }
++
++    if (refit) {
+         COM_TRC("%s", "fitting params to device memory ...\n");
+         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+ 
+@@ -1274,6 +1290,9 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+             params.fit_params_min_ctx,
+             has_draft || spec_mtp ? &extra : nullptr,
+             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
++
++        std::lock_guard<std::mutex> lock(fitted_mutex);
++        fitted[params.model.path] = { mparams, cparams };
+     }
+ 
+     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+diff --git a/common/common.h b/common/common.h
+index 0c2d5e4..d46ba16 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -661,6 +661,8 @@ struct common_params {
+     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
+     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
+     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
++    bool sleep_park          = false; // sleeping parks the model weights in pinned host memory instead of freeing them
++    bool sleep_park_keep_ram = false; // keep that pinned memory while awake, so parking only copies
+ 
+     std::vector<std::string> api_keys;
+ 
+diff --git a/include/llama.h b/include/llama.h
+index 3af6e22..51aa987 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -650,6 +650,20 @@ extern "C" {
+     // Returns the total size of all the tensors in the model in bytes
+     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
+ 
++    // Move the model's device weights to pinned host memory and back. Free every context that uses the model before parking.
++    LLAMA_API bool llama_model_park  (struct llama_model * model);
++    LLAMA_API bool llama_model_unpark(struct llama_model * model);
++
++    // With the park cache on, llama_model_free parks a model loaded from a file, and loading the same file again wakes it.
++    // keep_pinned: keep the pinned host memory after waking, so the next park only copies.
++    LLAMA_API void llama_model_park_cache_set(bool enable, bool keep_pinned);
++
++    // Whether a parked model loaded from this file is waiting in the park cache.
++    LLAMA_API bool llama_model_park_cache_has(const char * path_model);
++
++    // Whether this model object came out of the park cache (the same object that was parked) rather than from the file.
++    LLAMA_API bool llama_model_is_woken(const struct llama_model * model);
++
+     // Get the default chat template. Returns nullptr if not available
+     // If name is NULL, returns the default chat template
+     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 099c7a0..2d35fad 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -25,6 +25,10 @@
+ #include "ggml.h"
+ #include "ggml-cpp.h"
+ 
++#include <thread>
++#include <mutex>
++#include <map>
++#include <chrono>
+ #include <algorithm>
+ #include <cassert>
+ #include <cfloat>
+@@ -1263,6 +1267,20 @@ struct llama_model::impl {
+     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
+     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+ 
++    // device weight buffers moved to pinned host memory by park()
++    struct parked_buf {
++        size_t ctx_idx;
++        size_t buf_idx;
++        ggml_backend_buffer_type_t buft;
++        size_t size;
++        std::vector<std::pair<ggml_tensor *, size_t>> tensors; // tensor, offset in the buffer
++        std::vector<ggml_backend_buffer_ptr> hosts; // the buffer's bytes, in chunks
++    };
++    std::vector<parked_buf> parked;
++
++    // pinned chunks kept after unpark(keep_host = true), reused by the next park(), keyed by (ctx_idx, buf_idx)
++    std::map<std::pair<size_t, size_t>, std::vector<ggml_backend_buffer_ptr>> kept_hosts;
++
+     buft_list_t cpu_buft_list;
+     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+ 
+@@ -2400,6 +2418,127 @@ size_t llama_model::size() const {
+     return pimpl->n_bytes;
+ }
+ 
++// a 1-d view over a whole buffer, so that get/set calls can copy any byte range of it (padding included)
++static ggml_tensor llama_whole_buffer_view(ggml_backend_buffer_t buf, void * base, size_t size) {
++    ggml_tensor t = {};
++    t.type   = GGML_TYPE_I8;
++    t.ne[0]  = (int64_t) size;
++    t.ne[1]  = t.ne[2] = t.ne[3] = 1;
++    t.nb[0]  = 1;
++    t.nb[1]  = t.nb[2] = t.nb[3] = size;
++    t.buffer = buf;
++    t.data   = base;
++    return t;
++}
++
++// pinned host memory is kept in chunks: one huge transfer is slow on Windows, and unpinning chunks one by one later does not block the GPU for long
++static size_t llama_park_chunk() {
++    const char * env = getenv("LLAMA_PARK_CHUNK_MB");
++    const long long mb = env ? atoll(env) : 0;
++    return (size_t) (mb > 0 ? mb : 256) << 20;
++}
++
++bool llama_model::park() {
++    if (!pimpl->parked.empty()) {
++        return true;
++    }
++    const size_t chunk = llama_park_chunk();
++    for (size_t ci = 0; ci < pimpl->ctxs_bufs.size(); ci++) {
++        auto & [ctx, bufs] = pimpl->ctxs_bufs[ci];
++        for (size_t bi = 0; bi < bufs.size(); bi++) {
++            ggml_backend_buffer_t buf = bufs[bi].get();
++            if (buf == nullptr || ggml_backend_buffer_is_host(buf)) {
++                continue;
++            }
++            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
++            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
++            ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
++            const size_t size = ggml_backend_buffer_get_size(buf);
++            if (host_buft == nullptr || size == 0) {
++                continue;
++            }
++            char * base = (char *) ggml_backend_buffer_get_base(buf);
++            ggml_tensor view = llama_whole_buffer_view(buf, base, size);
++            llama_model::impl::parked_buf p = { ci, bi, buft, size, {}, {} };
++            const int64_t t0 = ggml_time_us();
++            auto kept = pimpl->kept_hosts.find({ ci, bi });
++            if (kept != pimpl->kept_hosts.end()) {
++                p.hosts = std::move(kept->second);
++                pimpl->kept_hosts.erase(kept);
++            }
++            for (size_t i = 0, off = 0; off < size; i++, off += chunk) {
++                const size_t n = std::min(chunk, size - off);
++                if (i >= p.hosts.size()) {
++                    ggml_backend_buffer_ptr host(ggml_backend_buft_alloc_buffer(host_buft, n));
++                    if (!host) {
++                        LLAMA_LOG_ERROR("%s: failed to allocate %.2f MiB of pinned memory\n", __func__, n / 1024.0 / 1024.0);
++                        return false;
++                    }
++                    p.hosts.push_back(std::move(host));
++                }
++                ggml_backend_tensor_get(&view, ggml_backend_buffer_get_base(p.hosts[i].get()), off, n);
++            }
++            LLAMA_LOG_WARN("%s: %.2f GiB to pinned host memory in %.2f s\n", __func__, size / 1073741824.0, (ggml_time_us() - t0) / 1e6);
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++                if (t->buffer == buf) {
++                    p.tensors.emplace_back(t, (size_t) ((char *) t->data - base));
++                    t->data   = nullptr;
++                    t->buffer = nullptr;
++                }
++            }
++            bufs[bi].reset();
++            pimpl->parked.push_back(std::move(p));
++        }
++    }
++    return true;
++}
++
++bool llama_model::unpark(bool keep_host) {
++    const size_t chunk = llama_park_chunk();
++    std::vector<ggml_backend_buffer_ptr> hosts;
++    for (auto & p : pimpl->parked) {
++        const int64_t t0 = ggml_time_us();
++        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(p.buft, p.size);
++        if (buf == nullptr) {
++            LLAMA_LOG_ERROR("%s: failed to allocate %.2f MiB of device memory\n", __func__, p.size / 1024.0 / 1024.0);
++            return false;
++        }
++        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        char * base = (char *) ggml_backend_buffer_get_base(buf);
++        ggml_tensor view = llama_whole_buffer_view(buf, base, p.size);
++        for (size_t i = 0; i < p.hosts.size(); i++) {
++            const size_t off = i * chunk;
++            ggml_backend_tensor_set(&view, ggml_backend_buffer_get_base(p.hosts[i].get()), off, std::min(chunk, p.size - off));
++        }
++        LLAMA_LOG_WARN("%s: %.2f GiB back to the device in %.2f s\n", __func__, p.size / 1073741824.0, (ggml_time_us() - t0) / 1e6);
++        for (auto & [t, offs] : p.tensors) {
++            t->data   = base + offs;
++            t->buffer = buf;
++        }
++        pimpl->ctxs_bufs[p.ctx_idx].second[p.buf_idx].reset(buf);
++        if (keep_host) {
++            pimpl->kept_hosts[{ p.ctx_idx, p.buf_idx }] = std::move(p.hosts);
++            continue;
++        }
++        for (auto & h : p.hosts) {
++            hosts.push_back(std::move(h));
++        }
++    }
++    pimpl->parked.clear();
++    // unpin one chunk at a time with gaps, so that other GPU work is not held up while the memory is returned
++    std::thread([hosts = std::move(hosts)]() mutable {
++        for (auto & h : hosts) {
++            h.reset();
++            std::this_thread::sleep_for(std::chrono::milliseconds(5));
++        }
++    }).detach();
++    return true;
++}
++
++bool llama_model::is_parked() const {
++    return !pimpl->parked.empty();
++}
++
+ size_t llama_model::n_tensors() const {
+     return tensors_by_name.size();
+ }
+@@ -3373,7 +3512,81 @@ void llama_free_model(llama_model * model) {
+     llama_model_free(model);
+ }
+ 
++// park cache: with it on, llama_model_free parks a loaded model instead of deleting it, and the next
++// llama_model_load_from_file of the same file and placement gets it back (llama-server --sleep-park)
++static struct {
++    std::mutex mutex;
++    bool enabled     = false;
++    bool keep_pinned = false;
++    std::vector<llama_model *> models;
++} g_park_cache;
++
++void llama_model_park_cache_set(bool enable, bool keep_pinned) {
++    std::lock_guard<std::mutex> lock(g_park_cache.mutex);
++    g_park_cache.enabled     = enable;
++    g_park_cache.keep_pinned = keep_pinned;
++}
++
++static std::string llama_park_key_path(const std::string & key) {
++    return key.substr(0, key.find('|'));
++}
++
++bool llama_model_is_woken(const llama_model * model) {
++    return model->woken;
++}
++
++bool llama_model_park_cache_has(const char * path_model) {
++    std::lock_guard<std::mutex> lock(g_park_cache.mutex);
++    for (llama_model * model : g_park_cache.models) {
++        if (llama_park_key_path(model->park_key) == path_model) {
++            return true;
++        }
++    }
++    return false;
++}
++
++llama_model * llama_model_park_cache_take(const std::string & key) {
++    std::lock_guard<std::mutex> lock(g_park_cache.mutex);
++    // a parked copy of the same file with another placement is stale: free it instead of keeping its pinned memory
++    for (auto it = g_park_cache.models.begin(); it != g_park_cache.models.end();) {
++        if ((*it)->park_key != key && llama_park_key_path((*it)->park_key) == llama_park_key_path(key)) {
++            LLAMA_LOG_WARN("%s: dropping a parked copy loaded with other settings\n", __func__);
++            delete *it;
++            it = g_park_cache.models.erase(it);
++        } else {
++            ++it;
++        }
++    }
++    for (auto it = g_park_cache.models.begin(); it != g_park_cache.models.end(); ++it) {
++        if ((*it)->park_key == key) {
++            llama_model * model = *it;
++            g_park_cache.models.erase(it);
++            const int64_t t0 = ggml_time_us();
++            if (!model->unpark(g_park_cache.keep_pinned)) {
++                delete model;
++                return nullptr;
++            }
++            LLAMA_LOG_INFO("%s: model woken from park in %.2f s\n", __func__, (ggml_time_us() - t0) / 1e6);
++            model->woken = true;
++            return model;
++        }
++    }
++    return nullptr;
++}
++
+ void llama_model_free(llama_model * model) {
++    if (model != nullptr && !model->park_key.empty()) {
++        std::lock_guard<std::mutex> lock(g_park_cache.mutex);
++        if (g_park_cache.enabled) {
++            const int64_t t0 = ggml_time_us();
++            if (model->park()) {
++                LLAMA_LOG_INFO("%s: model parked in host memory in %.2f s\n", __func__, (ggml_time_us() - t0) / 1e6);
++                g_park_cache.models.push_back(model);
++                return;
++            }
++            model->unpark();
++        }
++    }
+     delete model;
+ }
+ 
+@@ -3726,6 +3939,14 @@ uint64_t llama_model_size(const llama_model * model) {
+     return model->size();
+ }
+ 
++bool llama_model_park(llama_model * model) {
++    return model->park();
++}
++
++bool llama_model_unpark(llama_model * model) {
++    return model->unpark();
++}
++
+ const char * llama_model_chat_template(const llama_model * model, const char * name) {
+     const auto key = name ? LLM_KV(model->arch, name)(LLM_KV_TOKENIZER_CHAT_TEMPLATE)
+         : LLM_KV(model->arch)(LLM_KV_TOKENIZER_CHAT_TEMPLATE);
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 6487b0e..2f3487b 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -866,6 +866,15 @@ struct llama_model {
+     llama_ftype ftype() const;
+ 
+     size_t size() const; // file size
++
++    // move device weight buffers to pinned host memory and back (no context may use the model meanwhile)
++    bool park();
++    bool unpark(bool keep_host = false);
++    bool is_parked() const;
++
++    std::string park_key; // set at load; the park cache files the model under it
++    bool woken = false;   // came out of the park cache rather than from the file
++
+     size_t n_tensors() const;
+     size_t n_devices() const;
+     const float * tensor_split() const;
+@@ -1005,3 +1014,6 @@ const char * llm_type_name(llm_type type);
+ // For internal test use
+ // TODO: remove
+ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
++
++// park cache (see llama_model_free): the parked model filed under key, woken; nullptr if none
++llama_model * llama_model_park_cache_take(const std::string & key);
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 9beb148..c4ecc81 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -466,8 +466,19 @@ struct llama_model * llama_load_model_from_file(
+ struct llama_model * llama_model_load_from_file(
+         const char * path_model,
+         struct llama_model_params params) {
++    std::string key;
++    if (!params.no_alloc && !params.vocab_only) {
++        key = format("%s|%d|%d|%d", path_model, params.n_gpu_layers, (int) params.split_mode, params.main_gpu);
++        if (llama_model * parked = llama_model_park_cache_take(key)) {
++            return parked;
++        }
++    }
+     std::vector<std::string> splits = {};
+-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
++    llama_model * model = llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
++    if (model != nullptr) {
++        model->park_key = key;
++    }
++    return model;
+ }
+ 
+ struct llama_model * llama_model_load_from_splits(
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 793b8cd..15cd3de 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -178,8 +178,16 @@ struct clip_ctx {
+     std::mt19937 rng{std::random_device{}()};
+     uint32_t rng_seed = UINT32_MAX;
+ 
++    // clip_park(): the weights wait in pinned host memory, at these offsets, while buf is freed
++    ggml_backend_buffer_ptr parked_host;
++    std::vector<std::pair<ggml_tensor *, size_t>> parked_tensors;
++    ggml_backend_sched_eval_callback cb_eval = nullptr;
++    void * cb_eval_user_data = nullptr;
++
+     clip_ctx(clip_context_params & ctx_params) {
+         flash_attn_type = ctx_params.flash_attn_type;
++        cb_eval = ctx_params.cb_eval;
++        cb_eval_user_data = ctx_params.cb_eval_user_data;
+         no_alloc = ctx_params.no_alloc;
+         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+         if (!backend_cpu) {
+@@ -4268,6 +4276,69 @@ void clip_free(clip_ctx * ctx) {
+     delete ctx;
+ }
+ 
++bool clip_park(clip_ctx * ctx) {
++    if (ctx == nullptr || !ctx->buf || ggml_backend_buffer_is_host(ctx->buf.get())) {
++        return true;
++    }
++    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(ctx->backend));
++    if (host_buft == nullptr) {
++        return false;
++    }
++    size_t total = 0;
++    for (ggml_tensor * t = ggml_get_first_tensor(ctx->ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx->ctx_data.get(), t)) {
++        total += ggml_nbytes(t);
++    }
++    if (!ctx->parked_host || ggml_backend_buffer_get_size(ctx->parked_host.get()) < total) {
++        ctx->parked_host.reset(ggml_backend_buft_alloc_buffer(host_buft, total));
++        if (!ctx->parked_host) {
++            LOG_ERR("%s: failed to allocate %.2f MiB of pinned memory\n", __func__, total / 1024.0 / 1024.0);
++            return false;
++        }
++    }
++    char * host = (char *) ggml_backend_buffer_get_base(ctx->parked_host.get());
++    size_t off = 0;
++    ctx->parked_tensors.clear();
++    for (ggml_tensor * t = ggml_get_first_tensor(ctx->ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx->ctx_data.get(), t)) {
++        ggml_backend_tensor_get(t, host + off, 0, ggml_nbytes(t));
++        ctx->parked_tensors.emplace_back(t, off);
++        off += ggml_nbytes(t);
++    }
++    for (auto & [t, o] : ctx->parked_tensors) {
++        t->data   = nullptr;
++        t->buffer = nullptr;
++    }
++    ctx->buf.reset();
++    // a new scheduler drops the compute buffers; the next clip_encode reserves them again
++    ctx->sched.reset(ggml_backend_sched_new(ctx->backend_ptrs.data(), ctx->backend_buft.data(), ctx->backend_ptrs.size(), 8192, false, true));
++    if (ctx->cb_eval != nullptr) {
++        ggml_backend_sched_set_eval_callback(ctx->sched.get(), ctx->cb_eval, ctx->cb_eval_user_data);
++    }
++    ctx->is_allocated = false;
++    return true;
++}
++
++bool clip_unpark(clip_ctx * ctx, bool keep_host) {
++    if (ctx == nullptr || ctx->parked_tensors.empty()) {
++        return true;
++    }
++    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx->backend);
++    ctx->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx->ctx_data.get(), buft));
++    if (!ctx->buf) {
++        LOG_ERR("%s: failed to allocate the projector weights\n", __func__);
++        return false;
++    }
++    ggml_backend_buffer_set_usage(ctx->buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    const char * host = (const char *) ggml_backend_buffer_get_base(ctx->parked_host.get());
++    for (auto & [t, off] : ctx->parked_tensors) {
++        ggml_backend_tensor_set(t, host + off, 0, ggml_nbytes(t));
++    }
++    ctx->parked_tensors.clear();
++    if (!keep_host) {
++        ctx->parked_host.reset();
++    }
++    return true;
++}
++
+ const char * clip_patch_merge_type(const struct clip_ctx * ctx) {
+     return ctx->model.hparams.mm_patch_merge_type == PATCH_MERGE_SPATIAL_UNPAD ? "spatial_unpad" : "flat";
+ }
+diff --git a/tools/mtmd/clip.h b/tools/mtmd/clip.h
+index 19db476..cbce20f 100644
+--- a/tools/mtmd/clip.h
++++ b/tools/mtmd/clip.h
+@@ -74,6 +74,10 @@ int clip_get_image_max_tokens(const struct clip_ctx * ctx);
+ 
+ void clip_free(struct clip_ctx * ctx);
+ 
++// move the weights to pinned host memory and free the device buffers, and back
++bool clip_park  (struct clip_ctx * ctx);
++bool clip_unpark(struct clip_ctx * ctx, bool keep_host);
++
+ // TODO: should be enum, not string
+ const char * clip_patch_merge_type(const struct clip_ctx * ctx);
+ 
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index 26d5ee4..94df9e1 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -1188,6 +1188,14 @@ void mtmd_free(mtmd_context * ctx) {
+     delete ctx;
+ }
+ 
++bool mtmd_park(mtmd_context * ctx) {
++    return clip_park(ctx->ctx_v) && clip_park(ctx->ctx_a) && clip_park(ctx->ctx_gen_a);
++}
++
++bool mtmd_unpark(mtmd_context * ctx, bool keep_host) {
++    return clip_unpark(ctx->ctx_v, keep_host) && clip_unpark(ctx->ctx_a, keep_host) && clip_unpark(ctx->ctx_gen_a, keep_host);
++}
++
+ std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::vector<mtmd_internal_part> & parts, int n_merge) {
+     std::vector<std::vector<const mtmd_bitmap *>> output;
+     for (size_t i = 0; i < parts.size(); i++) {
+diff --git a/tools/mtmd/mtmd.h b/tools/mtmd/mtmd.h
+index df24c56..66f5134 100644
+--- a/tools/mtmd/mtmd.h
++++ b/tools/mtmd/mtmd.h
+@@ -136,6 +136,11 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
+ 
+ MTMD_API void mtmd_free(mtmd_context * ctx);
+ 
++// move the projector weights to pinned host memory, freeing their device memory, and back
++// the context keeps pointing at its text model, so only unpark it next to that same model
++MTMD_API bool mtmd_park  (mtmd_context * ctx);
++MTMD_API bool mtmd_unpark(mtmd_context * ctx, bool keep_host);
++
+ // whether we need to set non-causal mask before llama_decode
+ // if chunk is nullptr, we assume the default case where chunk is an image chunk
+ MTMD_API bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a18b754..68422ce 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -948,6 +948,8 @@ public:
+     llama_model * model_tgt = nullptr;
+ 
+     mtmd_context * mctx = nullptr;
++    // --sleep-park: the projector kept through sleep with its weights in pinned host memory
++    mtmd_context * mctx_parked = nullptr;
+     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
+     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
+     const llama_vocab * vocab = nullptr;
+@@ -972,6 +974,7 @@ public:
+             // we don't call it again here to avoid double free
+             destroy();
+         }
++        mtmd_free(mctx_parked);
+     }
+ 
+     server_metrics get_metrics() const {
+@@ -1064,12 +1067,21 @@ private:
+     void handle_sleeping_state(bool new_state) {
+         GGML_ASSERT(sleeping != new_state);
+         if (new_state) {
++            SRV_INF("%s", "server is entering sleeping state\n");
++            if (params_base.sleep_park && mctx != nullptr) {
++                const int64_t t0 = ggml_time_us();
++                if (mtmd_park(mctx)) {
++                    SRV_WRN("projector parked in pinned host memory in %.2f s\n", (ggml_time_us() - t0) / 1e6);
++                    mctx_parked = mctx;
++                    mctx = nullptr;
++                }
++            }
++            destroy();
++            // after destroy(): "sleeping" then means the model no longer holds device memory
+             if (callback_state) {
+                 callback_state(SERVER_STATE_SLEEPING, {});
+                 // note: for sleeping == false, event is emitted by load_model()
+             }
+-            SRV_INF("%s", "server is entering sleeping state\n");
+-            destroy();
+         } else {
+             SRV_INF("%s", "server is exiting sleeping state\n");
+             if (!load_model(params_base)) {
+@@ -1301,7 +1313,20 @@ private:
+                 }
+             }
+ 
+-            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
++            // the parked projector still points at its text model: reuse it only when that model was woken, not reloaded
++            if (mctx_parked != nullptr) {
++                const int64_t t0 = ggml_time_us();
++                if (llama_model_is_woken(model_tgt) && mtmd_unpark(mctx_parked, params_base.sleep_park_keep_ram)) {
++                    SRV_WRN("projector back on the device in %.2f s\n", (ggml_time_us() - t0) / 1e6);
++                    mctx = mctx_parked;
++                } else {
++                    mtmd_free(mctx_parked);
++                }
++                mctx_parked = nullptr;
++            }
++            if (mctx == nullptr) {
++                mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
++            }
+             if (mctx == nullptr) {
+                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
+                 return false;
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 871e827..e8d56de 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -116,6 +116,12 @@ int llama_server(int argc, char ** argv) {
+     SRV_INF("%s", "initializing ...\n");
+ 
+     llama_backend_init();
++    if (params.sleep_park) {
++        if (params.sleep_idle_seconds <= 0) {
++            LOG_WRN("%s", "--sleep-park has no effect without --sleep-idle-seconds\n");
++        }
++        llama_model_park_cache_set(true, params.sleep_park_keep_ram);
++    }
+     llama_numa_init(params.numa);
+ 
+     const int result = llama_server(params, argc, argv, child);
