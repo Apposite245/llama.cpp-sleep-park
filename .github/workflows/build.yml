@@ -1,0 +1,129 @@
+# Daily: if llama.cpp has a newer release tag than the last sleep-park release, apply the patch to it,
+# build llama-server (Windows, CUDA, sm_120) and publish it as a release "<tag>-park1".
+# If the patch no longer applies or the build fails, an issue labelled "auto-build" is opened (or commented).
+name: build
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'llama.cpp tag to build (empty = latest release)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  CUDA_VERSION: '13.4'                              # must be a version llama.cpp's windows-setup-cuda action knows
+  CUDA_DEFINES: '-DGGML_CUDA_CCCL_VERSION=v3.4.3'   # same as llama.cpp's own release job for that CUDA version
+  CUDA_ARCH: '120'                                  # RTX 50-series
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      build: ${{ steps.tag.outputs.build }}
+    steps:
+      - id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-$(gh api repos/ggml-org/llama.cpp/releases/latest --jq .tag_name)}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag-park1" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "$tag-park1 already released"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 300
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: patch
+
+      # full history without blobs: git apply --3way fetches the patch's base blobs on demand
+      - name: Clone llama.cpp
+        shell: pwsh
+        run: |
+          git -c core.autocrlf=false clone --filter=blob:none --no-checkout https://github.com/ggml-org/llama.cpp src
+          git -C src config core.autocrlf false
+          git -C src -c advice.detachedHead=false checkout "tags/$env:TAG"
+
+      - name: Apply patch
+        shell: pwsh
+        run: |
+          git -C src -c user.name=ci -c user.email=ci@localhost apply --3way --whitespace=nowarn ../patch/sleep-park.patch
+          if ($LASTEXITCODE -ne 0) { git -C src diff --name-only --diff-filter=U; exit 1 }
+
+      - name: Install CUDA
+        uses: ./src/.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ env.CUDA_VERSION }}
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build
+        shell: cmd
+        working-directory: src
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=%CUDA_ARCH% -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF %CUDA_DEFINES% || exit /b 1
+          cmake --build build --target llama-server -j %NUMBER_OF_PROCESSORS% || exit /b 1
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dst = "llama-server-sleep-park-$env:TAG-win-cuda$env:CUDA_VERSION-sm$env:CUDA_ARCH"
+          New-Item -ItemType Directory $dst | Out-Null
+          Copy-Item src\build\bin\*.exe, src\build\bin\*.dll $dst
+          foreach ($d in "bin", "bin\x64", "lib") {
+            Copy-Item "$env:CUDA_PATH\$d\cudart64_*.dll", "$env:CUDA_PATH\$d\cublas64_*.dll", "$env:CUDA_PATH\$d\cublasLt64_*.dll" $dst -ErrorAction SilentlyContinue
+          }
+          if (-not (Test-Path "$dst\cublasLt64_*.dll")) { throw "CUDA runtime DLLs not found under $env:CUDA_PATH" }
+          Copy-Item patch\LICENSE-llama.cpp $dst
+          # the runner has no GPU, so check the flag string instead of running the server
+          if (-not (Select-String -Path "$dst\llama-common.dll" -Pattern '--sleep-park-keep-ram' -SimpleMatch -Quiet)) { throw "build has no --sleep-park flag" }
+          7z a "$dst.zip" $dst | Out-Null
+          "ZIP=$dst.zip" >> $env:GITHUB_ENV
+
+      - name: Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = "llama-server $env:TAG with the sleep-park patch, built automatically. Windows, CUDA $env:CUDA_VERSION, RTX 50-series (sm_$env:CUDA_ARCH) only; the CUDA runtime DLLs are included. Not tested on a GPU before release. Unzip and run llama-server.exe with --sleep-idle-seconds N --sleep-park (or --sleep-park-keep-ram)."
+          gh release create "$env:TAG-park1" $env:ZIP --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "$env:TAG + sleep-park (Windows CUDA $env:CUDA_VERSION, sm_$env:CUDA_ARCH)" --notes $notes
+
+      - name: Report failure
+        if: failure()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $msg = "Automatic build for llama.cpp $env:TAG failed: $run`nIf the 'Apply patch' step failed, the patch needs rebasing onto the new llama.cpp."
+          gh label create auto-build --repo $env:GITHUB_REPOSITORY --color d93f0b --force | Out-Null
+          $open = gh issue list --repo $env:GITHUB_REPOSITORY --label auto-build --state open --json number --jq '.[0].number'
+          if ($open) { gh issue comment $open --repo $env:GITHUB_REPOSITORY --body $msg }
+          else { gh issue create --repo $env:GITHUB_REPOSITORY --label auto-build --title "Automatic build failed ($env:TAG)" --body $msg }

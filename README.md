@@ -7,7 +7,8 @@ waking copies the weights back over PCIe instead of loading the GGUF file again.
 It is made for a GPU shared between an LLM and something else (for example ComfyUI generating video):
 the LLM must give back its VRAM between requests, but reloading it every time costs seconds.
 
-Patch against llama.cpp **b11701** (commit `01fc3aa`). Not submitted upstream.
+Patch against llama.cpp **b11946** (commit `8ca4060`). Not submitted upstream. A daily GitHub Actions job
+applies it to the newest llama.cpp release and publishes a build (see [Release binaries](#release-binaries)).
 
 ## Measured
 
@@ -71,8 +72,8 @@ New public API: `llama_model_park`, `llama_model_unpark`, `llama_model_park_cach
 ```
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout b11701
-git -c core.autocrlf=false apply ..\sleep-park.patch
+git checkout b11946
+git -c core.autocrlf=false apply --3way ..\sleep-park.patch
 ```
 
 Then build as usual with CUDA, or use `build-windows.cmd` (edit the paths at the top first).
@@ -80,8 +81,16 @@ On Windows with `core.autocrlf=true`, clone with `-c core.autocrlf=false`, or th
 
 ## Release binaries
 
-The release has a Windows build of `llama-server` (CUDA 13.0, **RTX 50-series / sm_120 only**) with the
-CUDA runtime DLLs it needs. Other GPUs need a build from source.
+Each release is a Windows build of `llama-server` (**RTX 50-series / sm_120 only**) with the CUDA runtime
+DLLs it needs. Other GPUs need a build from source.
+
+`.github/workflows/build.yml` checks once a day for a new llama.cpp release. It applies the patch with
+`git apply --3way`, builds with CUDA 13.4 and publishes the result as `<tag>-park1`. These builds are
+compiled but not tested on a GPU. When the patch no longer applies or the build fails, the job opens an
+issue labelled `auto-build` (or comments on the open one) and no release is made until the patch is
+rebased. It can also be run by hand from the Actions tab, optionally for a specific tag.
+
+`b11701-park1` was built by hand with CUDA 13.0.
 
 ## License
 

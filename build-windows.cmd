@@ -1,5 +1,5 @@
 @echo off
-rem Builds llama-server with CUDA from a llama.cpp b11701 checkout with sleep-park.patch applied.
+rem Builds llama-server with CUDA from a llama.cpp checkout with sleep-park.patch applied.
 rem Usage: build-windows.cmd <path to the llama.cpp checkout>
 rem CUDA 13.0 does not accept the VS 2026 (v145) compiler, hence -vcvars_ver=14.44 (the v143 toolset).
 

@@ -1,8 +1,8 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 8b302d5..d543edc 100644
+index e6d6450f4a464e29b2bf40db0165403c51171708..254a9ccbc22d9840ac665e92f216a5e8feee0b17 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -3837,6 +3837,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -3872,6 +3872,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.sleep_idle_seconds = value;
          }
      ).set_examples({LLAMA_EXAMPLE_SERVER}));
@@ -25,7 +25,7 @@ index 8b302d5..d543edc 100644
          {"--simple-io"},
          "use basic IO for better compatibility in subprocesses and limited consoles",
 diff --git a/common/common.cpp b/common/common.cpp
-index b59e66e..9415361 100644
+index 221f0897cacec374e84553df2575fc8969364216..015465c6d050d117b5966813b9791748839832b7 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -26,6 +26,8 @@
@@ -34,14 +34,14 @@ index b59e66e..9415361 100644
  #include <iterator>
 +#include <map>
 +#include <mutex>
+ #include <random>
  #include <regex>
  #include <sstream>
- #include <string>
-@@ -1242,7 +1244,21 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1298,7 +1300,26 @@ common_init_result::common_init_result(common_params & params, bool model_only)
      auto mparams = common_model_params_to_llama(params);
      auto cparams = common_context_params_to_llama(params);
  
--    if (params.fit_params) {
+-    common_fit_apply(params, mparams, cparams);
 +    // a parked model wakes with the layout it was fitted to, so reuse that fit instead of probing again
 +    static std::mutex fitted_mutex;
 +    static std::map<std::string, std::pair<llama_model_params, llama_context_params>> fitted;
@@ -57,24 +57,19 @@ index b59e66e..9415361 100644
 +    }
 +
 +    if (refit) {
-         COM_TRC("%s", "fitting params to device memory ...\n");
-         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
- 
-@@ -1274,6 +1290,9 @@ common_init_result::common_init_result(common_params & params, bool model_only)
-             params.fit_params_min_ctx,
-             has_draft || spec_mtp ? &extra : nullptr,
-             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
++        common_fit_apply(params, mparams, cparams);
 +
 +        std::lock_guard<std::mutex> lock(fitted_mutex);
 +        fitted[params.model.path] = { mparams, cparams };
-     }
++    }
  
      llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+     if (model == NULL) {
 diff --git a/common/common.h b/common/common.h
-index 0c2d5e4..d46ba16 100644
+index cd89a27e92ba10ec6d4e0262afcf48ef69f89b76..203115dd400584769ab0229fb0c43f751b536696 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -661,6 +661,8 @@ struct common_params {
+@@ -667,6 +667,8 @@ struct common_params {
      int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
      bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
      int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
@@ -84,7 +79,7 @@ index 0c2d5e4..d46ba16 100644
      std::vector<std::string> api_keys;
  
 diff --git a/include/llama.h b/include/llama.h
-index 3af6e22..51aa987 100644
+index ae54e661bea6b305c0d3684670bc444c53d795bd..67a7c5ef0a6395713d8ad0dc8e61c225df8cc6be 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -650,6 +650,20 @@ extern "C" {
@@ -109,7 +104,7 @@ index 3af6e22..51aa987 100644
      // If name is NULL, returns the default chat template
      LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 099c7a0..2d35fad 100644
+index 81af8903f8442697266d2a340915dcb0d1ad0841..bcfbe8c88fe5176fb5951b861defd49e05aec984 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -25,6 +25,10 @@
@@ -123,7 +118,7 @@ index 099c7a0..2d35fad 100644
  #include <algorithm>
  #include <cassert>
  #include <cfloat>
-@@ -1263,6 +1267,20 @@ struct llama_model::impl {
+@@ -1281,6 +1285,20 @@ struct llama_model::impl {
      // contexts where the model tensors metadata is stored as well as the corresponding buffers:
      std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
  
@@ -144,7 +139,7 @@ index 099c7a0..2d35fad 100644
      buft_list_t cpu_buft_list;
      std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
  
-@@ -2400,6 +2418,127 @@ size_t llama_model::size() const {
+@@ -2429,6 +2447,127 @@ size_t llama_model::size() const {
      return pimpl->n_bytes;
  }
  
@@ -272,7 +267,7 @@ index 099c7a0..2d35fad 100644
  size_t llama_model::n_tensors() const {
      return tensors_by_name.size();
  }
-@@ -3373,7 +3512,81 @@ void llama_free_model(llama_model * model) {
+@@ -3411,7 +3550,81 @@ void llama_free_model(llama_model * model) {
      llama_model_free(model);
  }
  
@@ -354,7 +349,7 @@ index 099c7a0..2d35fad 100644
      delete model;
  }
  
-@@ -3726,6 +3939,14 @@ uint64_t llama_model_size(const llama_model * model) {
+@@ -3777,6 +3990,14 @@ uint64_t llama_model_size(const llama_model * model) {
      return model->size();
  }
  
@@ -370,10 +365,10 @@ index 099c7a0..2d35fad 100644
      const auto key = name ? LLM_KV(model->arch, name)(LLM_KV_TOKENIZER_CHAT_TEMPLATE)
          : LLM_KV(model->arch)(LLM_KV_TOKENIZER_CHAT_TEMPLATE);
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 6487b0e..2f3487b 100644
+index 222238efedfb402d46eb1226ae6e56d1d4578443..84e940e17b9e1fab64d377fd6bf7e5bbfb463e5f 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -866,6 +866,15 @@ struct llama_model {
+@@ -880,6 +880,15 @@ struct llama_model {
      llama_ftype ftype() const;
  
      size_t size() const; // file size
@@ -389,7 +384,7 @@ index 6487b0e..2f3487b 100644
      size_t n_tensors() const;
      size_t n_devices() const;
      const float * tensor_split() const;
-@@ -1005,3 +1014,6 @@ const char * llm_type_name(llm_type type);
+@@ -1020,3 +1029,6 @@ const char * llm_type_name(llm_type type);
  // For internal test use
  // TODO: remove
  const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
@@ -397,10 +392,10 @@ index 6487b0e..2f3487b 100644
 +// park cache (see llama_model_free): the parked model filed under key, woken; nullptr if none
 +llama_model * llama_model_park_cache_take(const std::string & key);
 diff --git a/src/llama.cpp b/src/llama.cpp
-index 9beb148..c4ecc81 100644
+index e3699ea1d534221ff9b4594ad89fae1097fef933..182d93912379d00bbc79f48ae3a75ccc9f3d5a5e 100644
 --- a/src/llama.cpp
 +++ b/src/llama.cpp
-@@ -466,8 +466,19 @@ struct llama_model * llama_load_model_from_file(
+@@ -465,8 +465,19 @@ struct llama_model * llama_load_model_from_file(
  struct llama_model * llama_model_load_from_file(
          const char * path_model,
          struct llama_model_params params) {
@@ -422,12 +417,12 @@ index 9beb148..c4ecc81 100644
  
  struct llama_model * llama_model_load_from_splits(
 diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
-index 793b8cd..15cd3de 100644
+index 26aa05e2591863bf1b50682222bacf9ab18e594f..adbab4d571d1aca89a5f9eeebe17216dcdc1058d 100644
 --- a/tools/mtmd/clip.cpp
 +++ b/tools/mtmd/clip.cpp
-@@ -178,8 +178,16 @@ struct clip_ctx {
-     std::mt19937 rng{std::random_device{}()};
-     uint32_t rng_seed = UINT32_MAX;
+@@ -174,8 +174,16 @@ struct clip_ctx {
+ 
+     bool support_batch = false;
  
 +    // clip_park(): the weights wait in pinned host memory, at these offsets, while buf is freed
 +    ggml_backend_buffer_ptr parked_host;
@@ -442,7 +437,7 @@ index 793b8cd..15cd3de 100644
          no_alloc = ctx_params.no_alloc;
          backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
          if (!backend_cpu) {
-@@ -4268,6 +4276,69 @@ void clip_free(clip_ctx * ctx) {
+@@ -4655,6 +4663,69 @@ void clip_free(clip_ctx * ctx) {
      delete ctx;
  }
  
@@ -513,10 +508,10 @@ index 793b8cd..15cd3de 100644
      return ctx->model.hparams.mm_patch_merge_type == PATCH_MERGE_SPATIAL_UNPAD ? "spatial_unpad" : "flat";
  }
 diff --git a/tools/mtmd/clip.h b/tools/mtmd/clip.h
-index 19db476..cbce20f 100644
+index cd3f434da5831a175671142b9b84696298924df9..b8c4175946de6b8ca0a0fa42ed74cd2bbc7841e0 100644
 --- a/tools/mtmd/clip.h
 +++ b/tools/mtmd/clip.h
-@@ -74,6 +74,10 @@ int clip_get_image_max_tokens(const struct clip_ctx * ctx);
+@@ -75,6 +75,10 @@ int clip_get_image_max_tokens(const struct clip_ctx * ctx);
  
  void clip_free(struct clip_ctx * ctx);
  
@@ -528,10 +523,10 @@ index 19db476..cbce20f 100644
  const char * clip_patch_merge_type(const struct clip_ctx * ctx);
  
 diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
-index 26d5ee4..94df9e1 100644
+index 7e0da513a8befe50ee95ceb2fe48be50abc891b8..293d6d5af27e5ea285bdc28e96002e9e7d17c8f0 100644
 --- a/tools/mtmd/mtmd.cpp
 +++ b/tools/mtmd/mtmd.cpp
-@@ -1188,6 +1188,14 @@ void mtmd_free(mtmd_context * ctx) {
+@@ -1223,6 +1223,14 @@ void mtmd_free(mtmd_context * ctx) {
      delete ctx;
  }
  
@@ -547,10 +542,10 @@ index 26d5ee4..94df9e1 100644
      std::vector<std::vector<const mtmd_bitmap *>> output;
      for (size_t i = 0; i < parts.size(); i++) {
 diff --git a/tools/mtmd/mtmd.h b/tools/mtmd/mtmd.h
-index df24c56..66f5134 100644
+index f552dddf9d95508b567886bf4f09d45a4594a061..4910386586fec3f545e97ea544089b9f6aa22524 100644
 --- a/tools/mtmd/mtmd.h
 +++ b/tools/mtmd/mtmd.h
-@@ -136,6 +136,11 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
+@@ -139,6 +139,11 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
  
  MTMD_API void mtmd_free(mtmd_context * ctx);
  
@@ -563,19 +558,19 @@ index df24c56..66f5134 100644
  // if chunk is nullptr, we assume the default case where chunk is an image chunk
  MTMD_API bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk);
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a18b754..68422ce 100644
+index 2bd1ab9ec00ca581c70bac014f7ca6d3d2bae0ae..ad5487dad54ed094961de3e2500c43bf753963d3 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -948,6 +948,8 @@ public:
+@@ -1023,6 +1023,8 @@ public:
      llama_model * model_tgt = nullptr;
  
      mtmd_context * mctx = nullptr;
 +    // --sleep-park: the projector kept through sleep with its weights in pinned host memory
 +    mtmd_context * mctx_parked = nullptr;
+     mtmd_helper_cap mtmd_cap = {};
      // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
      mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
-     const llama_vocab * vocab = nullptr;
-@@ -972,6 +974,7 @@ public:
+@@ -1059,6 +1061,7 @@ public:
              // we don't call it again here to avoid double free
              destroy();
          }
@@ -583,7 +578,7 @@ index a18b754..68422ce 100644
      }
  
      server_metrics get_metrics() const {
-@@ -1064,12 +1067,21 @@ private:
+@@ -1151,12 +1154,21 @@ private:
      void handle_sleeping_state(bool new_state) {
          GGML_ASSERT(sleeping != new_state);
          if (new_state) {
@@ -607,7 +602,7 @@ index a18b754..68422ce 100644
          } else {
              SRV_INF("%s", "server is exiting sleeping state\n");
              if (!load_model(params_base)) {
-@@ -1301,7 +1313,20 @@ private:
+@@ -1389,7 +1401,20 @@ private:
                  }
              }
  
@@ -630,10 +625,10 @@ index a18b754..68422ce 100644
                  SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                  return false;
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index 871e827..e8d56de 100644
+index 8b1d426506fdeb0f46b6a5ac225c08766d546399..80c82f6b1d2c972428f59fdc27a0f0b807175734 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
-@@ -116,6 +116,12 @@ int llama_server(int argc, char ** argv) {
+@@ -795,6 +795,12 @@ int llama_server(int argc, char ** argv) {
      SRV_INF("%s", "initializing ...\n");
  
      llama_backend_init();
@@ -645,4 +640,4 @@ index 871e827..e8d56de 100644
 +    }
      llama_numa_init(params.numa);
  
-     const int result = llama_server(params, argc, argv, child);
+     const int result = server_run(params, argc, argv, role, server_run_opts{});
