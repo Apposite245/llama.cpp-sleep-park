@@ -38,7 +38,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          tag="${INPUT_TAG:-$(gh api repos/ggml-org/llama.cpp/releases/latest --jq .tag_name)}"
+          # "latest" on GitHub is llama.cpp's stable vX.Y.Z line; the bNNNN build tags are what we want
+          tag="${INPUT_TAG:-$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=30' --jq '[.[] | select(.tag_name | test("^b[0-9]+$"))][0].tag_name')}"
+          [ -n "$tag" ] || { echo "no bNNNN release found"; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if gh release view "$tag-park1" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "$tag-park1 already released"
